@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import os
 import re
@@ -546,10 +547,7 @@ class Msg:
 async def send_msg(target: Message, m: Msg, reply_markup=None) -> None:
     text, entities = m.build()
     kwargs = {"reply_markup": reply_markup} if reply_markup is not None else {}
-    if entities:
-        await target.answer(text, entities=entities, parse_mode=None, **kwargs)
-    else:
-        await target.answer(text, **kwargs)
+    await target.answer(text, entities=entities, parse_mode=None, **kwargs)
 
 
 def parse_team_name_message(message: Message):
@@ -564,7 +562,7 @@ def parse_team_name_message(message: Message):
 
 
 def _team_label(row) -> str:
-    return row["team_name"] if row["team_name"] else NO_TEAM_LABEL
+    return html.escape(row["team_name"]) if row["team_name"] else NO_TEAM_LABEL
 
 
 def format_top_list(stat_key: str, players) -> str:
@@ -578,8 +576,9 @@ def format_top_list(stat_key: str, players) -> str:
         marker = MEDALS.get(idx, f"{idx}.")
         team = _team_label(p)
         value = p[stat_key]
+        nick = html.escape(p['nickname'])
         lines.append(
-            f"{marker} <b>{p['nickname']} #{p['number']}</b> — {team}\n"
+            f"{marker} <b>{nick} #{p['number']}</b> — {team}\n"
             f"     ▸ {value} {label} (М: {p['matches_played']})"
         )
     return "\n".join(lines)
@@ -687,13 +686,12 @@ async def show_team_roster_menu(message: Message):
 
 @user_router.callback_query(F.data.startswith("team:"))
 async def show_team_roster(callback: CallbackQuery):
-    # Подтверждаем получение callback
-    await callback.answer()
     team_id = int(callback.data.split(":")[1])
     team = await get_team(team_id)
     if team is None:
         await callback.answer("Команда не найдена", show_alert=True)
         return
+    await callback.answer()
     roster = await get_team_roster(team_id)
 
     m = Msg()
@@ -718,7 +716,6 @@ async def show_team_roster(callback: CallbackQuery):
                 )
 
     await send_msg(callback.message, m)
-    # Ответ уже отправлен в начале, дополнительно не нужно
 
 
 @user_router.message(F.text == BTN_FIND_PLAYER)
@@ -773,12 +770,12 @@ async def find_player_process(message: Message, state: FSMContext):
 
 @user_router.callback_query(F.data.startswith("player:"))
 async def show_player_by_callback(callback: CallbackQuery):
-    await callback.answer()
     player_id = int(callback.data.split(":")[1])
     player = await get_player_full(player_id)
     if player is None:
         await callback.answer("Игрок не найден", show_alert=True)
         return
+    await callback.answer()
     await _send_player_card(callback.message, player)
 
 
@@ -790,7 +787,7 @@ ADMIN_TITLE = "🛠 <b>Админ-панель Innovative Hockey League</b>\n\n�
 @admin_router.message(Command("adminka"))
 async def cmd_adminka(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
-        await message.answer("⛔ У вас нет доступа к админ-панели.")
+        await message.answer("⛔️ У вас нет доступа к админ-панели.")
         return
     await state.clear()
     await message.answer(ADMIN_TITLE, reply_markup=admin_main_kb())
@@ -799,7 +796,7 @@ async def cmd_adminka(message: Message, state: FSMContext):
 @admin_router.callback_query(F.data == "adm:back")
 async def adm_back(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Нет доступа", show_alert=True)
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
         return
     await callback.answer()
     await state.clear()
@@ -810,7 +807,7 @@ async def adm_back(callback: CallbackQuery, state: FSMContext):
 @admin_router.callback_query(F.data == "adm:teams")
 async def adm_teams_menu(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Нет доступа", show_alert=True)
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
         return
     await callback.answer()
     await callback.message.edit_text("🏒 Управление командами:", reply_markup=admin_teams_kb())
@@ -819,16 +816,15 @@ async def adm_teams_menu(callback: CallbackQuery):
 @admin_router.callback_query(F.data == "adm:team:create")
 async def adm_team_create_start(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Нет доступа", show_alert=True)
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
         return
-    await callback.answer()  # подтверждаем получение
+    await callback.answer()
     await state.set_state(AdminTeamStates.creating_name)
-    # Отправляем новое сообщение вместо редактирования, чтобы избежать конфликтов
     await callback.message.answer(
         "Отправьте название команды.\n\n"
         "💎 Если хотите прикрепить премиум-эмодзи как логотип — вставьте его прямо в текст "
         "названия (в любом месте), бот сам его распознает и сохранит.\n\n"
-        "Например: <эмодзи> ФК Атлант"
+        "Например: <code>&lt;эмодзи&gt; ФК Атлант</code>"
     )
 
 
@@ -846,21 +842,22 @@ async def adm_team_create_finish(message: Message, state: FSMContext):
         return
     team = await create_team(name, fallback, custom_emoji_id)
     logo_note = " (с логотипом)" if custom_emoji_id else ""
+    esc_name = html.escape(team['name'])
     await message.answer(
-        f"✅ Команда «{team['name']}»{logo_note} создана.", reply_markup=admin_teams_kb()
+        f"✅ Команда «{esc_name}»{logo_note} создана.", reply_markup=admin_teams_kb()
     )
 
 
 @admin_router.callback_query(F.data == "adm:team:delete")
 async def adm_team_delete_menu(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Нет доступа", show_alert=True)
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
         return
-    await callback.answer()
     teams = await get_teams()
     if not teams:
         await callback.answer("Нет команд для удаления", show_alert=True)
         return
+    await callback.answer()
     await callback.message.edit_text(
         "Выберите команду для удаления:", reply_markup=teams_list_kb(teams, "adm:team:del")
     )
@@ -869,17 +866,18 @@ async def adm_team_delete_menu(callback: CallbackQuery):
 @admin_router.callback_query(F.data.startswith("adm:team:del:"))
 async def adm_team_delete_confirm(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Нет доступа", show_alert=True)
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
         return
-    await callback.answer()
     team_id = int(callback.data.split(":")[-1])
     team = await get_team(team_id)
     if team is None:
         await callback.answer("Команда уже удалена", show_alert=True)
         return
+    await callback.answer()
     await delete_team(team_id)
+    esc_name = html.escape(team['name'])
     await callback.message.edit_text(
-        f"🗑 Команда «{team['name']}» удалена. Её игроки остались в базе, но без привязки к команде.",
+        f"🗑 Команда «{esc_name}» удалена. Её игроки остались в базе, но без привязки к команде.",
         reply_markup=admin_teams_kb(),
     )
 
@@ -887,14 +885,14 @@ async def adm_team_delete_confirm(callback: CallbackQuery):
 @admin_router.callback_query(F.data == "adm:team:list")
 async def adm_team_list(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Нет доступа", show_alert=True)
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
         return
     await callback.answer()
     teams = await get_teams()
     if not teams:
         text = "Команд пока нет."
     else:
-        text = "📃 <b>Список команд:</b>\n\n" + "\n".join(f"• {t['name']}" for t in teams)
+        text = "📃 <b>Список команд:</b>\n\n" + "\n".join(f"• {html.escape(t['name'])}" for t in teams)
     await callback.message.edit_text(text, reply_markup=admin_teams_kb())
 
 
@@ -902,13 +900,13 @@ async def adm_team_list(callback: CallbackQuery):
 @admin_router.callback_query(F.data == "adm:roster")
 async def adm_roster_menu(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Нет доступа", show_alert=True)
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
         return
-    await callback.answer()
     teams = await get_teams()
     if not teams:
         await callback.answer("Сначала создайте хотя бы одну команду", show_alert=True)
         return
+    await callback.answer()
     await callback.message.edit_text(
         "Выберите команду, состав которой нужно обновить:",
         reply_markup=teams_list_kb(teams, "adm:roster:team"),
@@ -918,19 +916,20 @@ async def adm_roster_menu(callback: CallbackQuery):
 @admin_router.callback_query(F.data.startswith("adm:roster:team:"))
 async def adm_roster_team_selected(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Нет доступа", show_alert=True)
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
         return
-    await callback.answer()
     team_id = int(callback.data.split(":")[-1])
     team = await get_team(team_id)
     if team is None:
         await callback.answer("Команда не найдена", show_alert=True)
         return
+    await callback.answer()
     await state.set_state(AdminRosterStates.waiting_list)
     await state.update_data(team_id=team_id)
     example = "miulio #9\nfrong #21\npetrov #64"
+    esc_name = html.escape(team['name'])
     await callback.message.edit_text(
-        f"Команда: <b>{team['name']}</b>\n\n"
+        f"Команда: <b>{esc_name}</b>\n\n"
         f"Отправьте список игроков, каждый на новой строке, в формате:\n<code>{example}</code>\n\n"
         "⚠️ Этот список <b>полностью заменит</b> текущий состав команды."
     )
@@ -968,13 +967,14 @@ async def adm_roster_list_process(message: Message, state: FSMContext):
 
     await clear_team_roster_except(team_id, keep_ids)
     team = await get_team(team_id)
+    esc_name = html.escape(team['name'])
 
     summary = (
-        f"✅ Состав команды «{team['name']}» обновлён.\n"
+        f"✅ Состав команды «{esc_name}» обновлён.\n"
         f"Новых игроков: {created}\nПривязано существующих: {updated}"
     )
     if errors:
-        bad = "\n".join(f"• строка {i}: {line}" for i, line in errors)
+        bad = "\n".join(f"• строка {i}: {html.escape(line)}" for i, line in errors)
         summary += f"\n\n⚠️ Не распознаны строки:\n{bad}"
     await message.answer(summary)
 
@@ -983,7 +983,7 @@ async def adm_roster_list_process(message: Message, state: FSMContext):
 @admin_router.callback_query(F.data == "adm:points")
 async def adm_points_start(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Нет доступа", show_alert=True)
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
         return
     await callback.answer()
     await state.set_state(AdminPointsStates.waiting_list)
@@ -1014,13 +1014,14 @@ async def adm_points_process(message: Message, state: FSMContext):
 
     report_lines = []
     for r in results:
+        nick = html.escape(r['nickname'])
         if r["type"] == "gk":
             _, created = await apply_goalkeeper_stats(
                 r["nickname"], r["number"], r["saves"], r["shots"], r["sign"]
             )
             tag = "🆕" if created else "✏️"
             report_lines.append(
-                f"{tag} 🥅 {r['nickname']} #{r['number']}: {r['sign']} {r['saves']}/{r['shots']}"
+                f"{tag} 🥅 {nick} #{r['number']}: {r['sign']} {r['saves']}/{r['shots']}"
             )
         else:
             _, created = await apply_skater_stats(
@@ -1028,12 +1029,12 @@ async def adm_points_process(message: Message, state: FSMContext):
             )
             tag = "🆕" if created else "✏️"
             report_lines.append(
-                f"{tag} ⛸ {r['nickname']} #{r['number']}: {r['sign']} Г{r['goals']} П{r['assists']}"
+                f"{tag} ⛸ {nick} #{r['number']}: {r['sign']} Г{r['goals']} П{r['assists']}"
             )
 
     summary = "✅ <b>Статистика обновлена:</b>\n\n" + "\n".join(report_lines)
     if errors:
-        bad = "\n".join(f"• строка {i}: {line}" for i, line in errors)
+        bad = "\n".join(f"• строка {i}: {html.escape(line)}" for i, line in errors)
         summary += f"\n\n⚠️ Не распознаны строки:\n{bad}"
     await message.answer(summary)
 
