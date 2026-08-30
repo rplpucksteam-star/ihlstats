@@ -687,6 +687,8 @@ async def show_team_roster_menu(message: Message):
 
 @user_router.callback_query(F.data.startswith("team:"))
 async def show_team_roster(callback: CallbackQuery):
+    # Подтверждаем получение callback
+    await callback.answer()
     team_id = int(callback.data.split(":")[1])
     team = await get_team(team_id)
     if team is None:
@@ -716,7 +718,7 @@ async def show_team_roster(callback: CallbackQuery):
                 )
 
     await send_msg(callback.message, m)
-    await callback.answer()
+    # Ответ уже отправлен в начале, дополнительно не нужно
 
 
 @user_router.message(F.text == BTN_FIND_PLAYER)
@@ -771,13 +773,13 @@ async def find_player_process(message: Message, state: FSMContext):
 
 @user_router.callback_query(F.data.startswith("player:"))
 async def show_player_by_callback(callback: CallbackQuery):
+    await callback.answer()
     player_id = int(callback.data.split(":")[1])
     player = await get_player_full(player_id)
     if player is None:
         await callback.answer("Игрок не найден", show_alert=True)
         return
     await _send_player_card(callback.message, player)
-    await callback.answer()
 
 
 # ---------- Админские хендлеры ----------
@@ -799,9 +801,9 @@ async def adm_back(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Нет доступа", show_alert=True)
         return
+    await callback.answer()
     await state.clear()
     await callback.message.edit_text(ADMIN_TITLE, reply_markup=admin_main_kb())
-    await callback.answer()
 
 
 # --- Команды ---
@@ -810,8 +812,8 @@ async def adm_teams_menu(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Нет доступа", show_alert=True)
         return
-    await callback.message.edit_text("🏒 Управление командами:", reply_markup=admin_teams_kb())
     await callback.answer()
+    await callback.message.edit_text("🏒 Управление командами:", reply_markup=admin_teams_kb())
 
 
 @admin_router.callback_query(F.data == "adm:team:create")
@@ -819,14 +821,15 @@ async def adm_team_create_start(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Нет доступа", show_alert=True)
         return
+    await callback.answer()  # подтверждаем получение
     await state.set_state(AdminTeamStates.creating_name)
-    await callback.message.edit_text(
+    # Отправляем новое сообщение вместо редактирования, чтобы избежать конфликтов
+    await callback.message.answer(
         "Отправьте название команды.\n\n"
         "💎 Если хотите прикрепить премиум-эмодзи как логотип — вставьте его прямо в текст "
         "названия (в любом месте), бот сам его распознает и сохранит.\n\n"
         "Например: <эмодзи> ФК Атлант"
     )
-    await callback.answer()
 
 
 @admin_router.message(AdminTeamStates.creating_name)
@@ -853,6 +856,7 @@ async def adm_team_delete_menu(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Нет доступа", show_alert=True)
         return
+    await callback.answer()
     teams = await get_teams()
     if not teams:
         await callback.answer("Нет команд для удаления", show_alert=True)
@@ -860,7 +864,6 @@ async def adm_team_delete_menu(callback: CallbackQuery):
     await callback.message.edit_text(
         "Выберите команду для удаления:", reply_markup=teams_list_kb(teams, "adm:team:del")
     )
-    await callback.answer()
 
 
 @admin_router.callback_query(F.data.startswith("adm:team:del:"))
@@ -868,6 +871,7 @@ async def adm_team_delete_confirm(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Нет доступа", show_alert=True)
         return
+    await callback.answer()
     team_id = int(callback.data.split(":")[-1])
     team = await get_team(team_id)
     if team is None:
@@ -878,7 +882,6 @@ async def adm_team_delete_confirm(callback: CallbackQuery):
         f"🗑 Команда «{team['name']}» удалена. Её игроки остались в базе, но без привязки к команде.",
         reply_markup=admin_teams_kb(),
     )
-    await callback.answer()
 
 
 @admin_router.callback_query(F.data == "adm:team:list")
@@ -886,13 +889,13 @@ async def adm_team_list(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Нет доступа", show_alert=True)
         return
+    await callback.answer()
     teams = await get_teams()
     if not teams:
         text = "Команд пока нет."
     else:
         text = "📃 <b>Список команд:</b>\n\n" + "\n".join(f"• {t['name']}" for t in teams)
     await callback.message.edit_text(text, reply_markup=admin_teams_kb())
-    await callback.answer()
 
 
 # --- Обновление состава ---
@@ -901,6 +904,7 @@ async def adm_roster_menu(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Нет доступа", show_alert=True)
         return
+    await callback.answer()
     teams = await get_teams()
     if not teams:
         await callback.answer("Сначала создайте хотя бы одну команду", show_alert=True)
@@ -909,7 +913,6 @@ async def adm_roster_menu(callback: CallbackQuery):
         "Выберите команду, состав которой нужно обновить:",
         reply_markup=teams_list_kb(teams, "adm:roster:team"),
     )
-    await callback.answer()
 
 
 @admin_router.callback_query(F.data.startswith("adm:roster:team:"))
@@ -917,6 +920,7 @@ async def adm_roster_team_selected(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Нет доступа", show_alert=True)
         return
+    await callback.answer()
     team_id = int(callback.data.split(":")[-1])
     team = await get_team(team_id)
     if team is None:
@@ -930,7 +934,6 @@ async def adm_roster_team_selected(callback: CallbackQuery, state: FSMContext):
         f"Отправьте список игроков, каждый на новой строке, в формате:\n<code>{example}</code>\n\n"
         "⚠️ Этот список <b>полностью заменит</b> текущий состав команды."
     )
-    await callback.answer()
 
 
 @admin_router.message(AdminRosterStates.waiting_list)
@@ -982,6 +985,7 @@ async def adm_points_start(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Нет доступа", show_alert=True)
         return
+    await callback.answer()
     await state.set_state(AdminPointsStates.waiting_list)
     example = "miulio #9 2 8 +\ndube #42 15/18 + gk\nsigma #1 4 5 +"
     await callback.message.edit_text(
@@ -993,7 +997,6 @@ async def adm_points_start(callback: CallbackQuery, state: FSMContext):
         "(отменить ошибочно внесённую запись). Очки (Г+П) бот считает сам.\n"
         "Если игрока нет в базе — он будет создан автоматически (без привязки к команде)."
     )
-    await callback.answer()
 
 
 @admin_router.message(AdminPointsStates.waiting_list)
