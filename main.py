@@ -1,0 +1,1064 @@
+import asyncio
+import logging
+import os
+import re
+from typing import List, Tuple, Optional, Dict, Any
+
+import asyncpg
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    MessageEntity,
+    ReplyKeyboardMarkup,
+)
+
+# ---------- Настройка логирования ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ---------- Конфигурация ----------
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+_admin_ids_raw = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = {
+    int(x) for x in _admin_ids_raw.replace(" ", "").split(",") if x.strip().isdigit()
+}
+
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN не задан. Добавьте переменную окружения BOT_TOKEN "
+        "(получить токен можно у @BotFather)."
+    )
+
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL не задан. Добавьте PostgreSQL плагин на Railway и укажите его "
+        "connection string в переменной окружения DATABASE_URL."
+    )
+
+if not ADMIN_IDS:
+    logger.warning(
+        "Переменная ADMIN_IDS пуста — команда /adminka недоступна никому."
+    )
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+# ---------- База данных ----------
+pool: Optional[asyncpg.Pool] = None
+
+
+def _normalize_dsn(dsn: str) -> str:
+    """Приводит postgres:// к postgresql:// для совместимости с asyncpg."""
+    if dsn.startswith("postgres://"):
+        return "postgresql://" + dsn[len("postgres://"):]
+    return dsn
+
+
+async def init_pool() -> None:
+    global pool
+    try:
+        pool = await asyncpg.create_pool(
+            dsn=_normalize_dsn(DATABASE_URL),
+            min_size=1,
+            max_size=5,
+            timeout=10.0
+        )
+        await create_tables()
+        logger.info("Пул соединений с PostgreSQL инициализирован.")
+    except Exception as e:
+        logger.critical("Не удалось подключиться к БД: %s", e)
+        raise
+
+
+async def close_pool() -> None:
+    if pool is not None:
+        await pool.close()
+        logger.info("Пул соединений закрыт.")
+
+
+async def create_tables() -> None:
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS teams (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                emoji_char TEXT,
+                custom_emoji_id TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT now()
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS players (
+                id SERIAL PRIMARY KEY,
+                nickname TEXT NOT NULL,
+                number INTEGER NOT NULL,
+                team_id INTEGER REFERENCES teams(id) ON DELETE SET NULL,
+                goals INTEGER NOT NULL DEFAULT 0,
+                assists INTEGER NOT NULL DEFAULT 0,
+                matches_played INTEGER NOT NULL DEFAULT 0,
+                saves INTEGER NOT NULL DEFAULT 0,
+                shots_against INTEGER NOT NULL DEFAULT 0,
+                is_goalkeeper BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMP NOT NULL DEFAULT now(),
+                UNIQUE (nickname, number)
+            );
+            """
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_players_nickname ON players (LOWER(nickname));"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_players_team ON players (team_id);"
+        )
+        logger.info("Таблицы созданы (или уже существуют).")
+
+
+# ---------- Запросы к БД ----------
+async def create_team(name: str, emoji_char: Optional[str], custom_emoji_id: Optional[str]):
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            """
+            INSERT INTO teams (name, emoji_char, custom_emoji_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (name) DO UPDATE
+                SET emoji_char = EXCLUDED.emoji_char,
+                    custom_emoji_id = EXCLUDED.custom_emoji_id
+            RETURNING *;
+            """,
+            name,
+            emoji_char,
+            custom_emoji_id,
+        )
+
+
+async def delete_team(team_id: int) -> None:
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM teams WHERE id = $1;", team_id)
+
+
+async def get_teams():
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        return await conn.fetch("SELECT * FROM teams ORDER BY name;")
+
+
+async def get_team(team_id: int):
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM teams WHERE id = $1;", team_id)
+
+
+async def upsert_roster_player(nickname: str, number: int, team_id: int):
+    """Привязывает игрока к команде, создаёт при отсутствии."""
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT id FROM players WHERE LOWER(nickname) = LOWER($1) AND number = $2;",
+            nickname,
+            number,
+        )
+        if existing:
+            await conn.execute(
+                "UPDATE players SET team_id = $1 WHERE id = $2;", team_id, existing["id"]
+            )
+            return existing["id"], False
+
+        row = await conn.fetchrow(
+            "INSERT INTO players (nickname, number, team_id) VALUES ($1, $2, $3) RETURNING id;",
+            nickname,
+            number,
+            team_id,
+        )
+        return row["id"], True
+
+
+async def clear_team_roster_except(team_id: int, keep_player_ids: List[int]) -> None:
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        if keep_player_ids:
+            await conn.execute(
+                "UPDATE players SET team_id = NULL WHERE team_id = $1 AND NOT (id = ANY($2::int[]));",
+                team_id,
+                keep_player_ids,
+            )
+        else:
+            await conn.execute("UPDATE players SET team_id = NULL WHERE team_id = $1;", team_id)
+
+
+async def get_team_roster(team_id: int):
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT *, (goals + assists) AS points
+            FROM players
+            WHERE team_id = $1
+            ORDER BY is_goalkeeper ASC, points DESC, goals DESC, nickname ASC;
+            """,
+            team_id,
+        )
+
+
+async def search_players(nickname_query: str):
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT p.*, t.name AS team_name, t.emoji_char, t.custom_emoji_id,
+                   (p.goals + p.assists) AS points
+            FROM players p
+            LEFT JOIN teams t ON p.team_id = t.id
+            WHERE LOWER(p.nickname) LIKE LOWER($1)
+            ORDER BY p.nickname
+            LIMIT 20;
+            """,
+            f"%{nickname_query}%",
+        )
+
+
+async def get_player_full(player_id: int):
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            """
+            SELECT p.*, t.name AS team_name, t.emoji_char, t.custom_emoji_id,
+                   (p.goals + p.assists) AS points
+            FROM players p
+            LEFT JOIN teams t ON p.team_id = t.id
+            WHERE p.id = $1;
+            """,
+            player_id,
+        )
+
+
+async def get_or_create_player(nickname: str, number: int):
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM players WHERE LOWER(nickname) = LOWER($1) AND number = $2;",
+            nickname,
+            number,
+        )
+        if row:
+            return row, False
+        row = await conn.fetchrow(
+            "INSERT INTO players (nickname, number) VALUES ($1, $2) RETURNING *;",
+            nickname,
+            number,
+        )
+        return row, True
+
+
+async def apply_skater_stats(nickname: str, number: int, goals: int, assists: int, sign: str):
+    row, created = await get_or_create_player(nickname, number)
+    mult = 1 if sign == "+" else -1
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE players
+            SET goals = GREATEST(goals + $1, 0),
+                assists = GREATEST(assists + $2, 0),
+                matches_played = GREATEST(matches_played + $3, 0)
+            WHERE id = $4;
+            """,
+            mult * goals,
+            mult * assists,
+            mult * 1,
+            row["id"],
+        )
+    return row["id"], created
+
+
+async def apply_goalkeeper_stats(nickname: str, number: int, saves: int, shots: int, sign: str):
+    row, created = await get_or_create_player(nickname, number)
+    mult = 1 if sign == "+" else -1
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE players
+            SET saves = GREATEST(saves + $1, 0),
+                shots_against = GREATEST(shots_against + $2, 0),
+                matches_played = GREATEST(matches_played + $3, 0),
+                is_goalkeeper = TRUE
+            WHERE id = $4;
+            """,
+            mult * saves,
+            mult * shots,
+            mult * 1,
+            row["id"],
+        )
+    return row["id"], created
+
+
+async def top_scorers(limit: int = 10):
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT p.*, t.name AS team_name, (p.goals + p.assists) AS points
+            FROM players p
+            LEFT JOIN teams t ON p.team_id = t.id
+            WHERE p.is_goalkeeper = FALSE
+            ORDER BY points DESC, p.goals DESC, p.nickname ASC
+            LIMIT $1;
+            """,
+            limit,
+        )
+
+
+async def top_snipers(limit: int = 10):
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT p.*, t.name AS team_name, (p.goals + p.assists) AS points
+            FROM players p
+            LEFT JOIN teams t ON p.team_id = t.id
+            WHERE p.is_goalkeeper = FALSE
+            ORDER BY p.goals DESC, p.assists DESC, p.nickname ASC
+            LIMIT $1;
+            """,
+            limit,
+        )
+
+
+async def top_assistants(limit: int = 10):
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT p.*, t.name AS team_name, (p.goals + p.assists) AS points
+            FROM players p
+            LEFT JOIN teams t ON p.team_id = t.id
+            WHERE p.is_goalkeeper = FALSE
+            ORDER BY p.assists DESC, p.goals DESC, p.nickname ASC
+            LIMIT $1;
+            """,
+            limit,
+        )
+
+
+# ---------- FSM состояния ----------
+class AdminTeamStates(StatesGroup):
+    creating_name = State()
+
+
+class AdminRosterStates(StatesGroup):
+    waiting_list = State()
+
+
+class AdminPointsStates(StatesGroup):
+    waiting_list = State()
+
+
+class UserSearchStates(StatesGroup):
+    waiting_nickname = State()
+
+
+# ---------- Парсинг текстовых списков ----------
+ROSTER_LINE_RE = re.compile(r"^\s*(\S+)\s*#\s*(\d+)\s*$")
+SKATER_LINE_RE = re.compile(
+    r"^\s*(\S+)\s*#\s*(\d+)\s+(\d+)\s+(\d+)\s+([+\-])\s*$"
+)
+GOALKEEPER_LINE_RE = re.compile(
+    r"^\s*(\S+)\s*#\s*(\d+)\s+(\d+)\s*/\s*(\d+)\s+([+\-])\s*gk\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_roster_lines(text: str):
+    entries = []
+    errors = []
+    for i, raw in enumerate(text.strip().splitlines(), start=1):
+        line = raw.strip()
+        if not line:
+            continue
+        m = ROSTER_LINE_RE.match(line)
+        if not m:
+            errors.append((i, line))
+            continue
+        nickname, number = m.group(1), int(m.group(2))
+        entries.append((nickname, number))
+    return entries, errors
+
+
+def parse_points_lines(text: str):
+    results = []
+    errors = []
+    for i, raw in enumerate(text.strip().splitlines(), start=1):
+        line = raw.strip()
+        if not line:
+            continue
+
+        m_gk = GOALKEEPER_LINE_RE.match(line)
+        if m_gk:
+            nickname, number, saves, shots, sign = m_gk.groups()
+            results.append(
+                {
+                    "type": "gk",
+                    "nickname": nickname,
+                    "number": int(number),
+                    "saves": int(saves),
+                    "shots": int(shots),
+                    "sign": sign,
+                    "raw": line,
+                }
+            )
+            continue
+
+        m_sk = SKATER_LINE_RE.match(line)
+        if m_sk:
+            nickname, number, goals, assists, sign = m_sk.groups()
+            results.append(
+                {
+                    "type": "skater",
+                    "nickname": nickname,
+                    "number": int(number),
+                    "goals": int(goals),
+                    "assists": int(assists),
+                    "sign": sign,
+                    "raw": line,
+                }
+            )
+            continue
+
+        errors.append((i, line))
+
+    return results, errors
+
+
+# ---------- Форматирование сообщений ----------
+MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+STAT_TITLES = {
+    "points": "🏆 Топ-10 бомбардиров (голы + передачи)",
+    "goals": "🎯 Топ-10 снайперов (голы)",
+    "assists": "🅰️ Топ-10 ассистентов (передачи)",
+}
+STAT_LABELS = {
+    "points": "очков",
+    "goals": "голов",
+    "assists": "передач",
+}
+NO_TEAM_LABEL = "Нет информации о команде"
+
+
+def _utf16_len(s: str) -> int:
+    return len(s.encode("utf-16-le")) // 2
+
+
+def extract_utf16_substring(text: str, offset: int, length: int) -> str:
+    u16 = text.encode("utf-16-le")
+    piece = u16[offset * 2: (offset + length) * 2]
+    return piece.decode("utf-16-le")
+
+
+def _strip_utf16_range(text: str, offset: int, length: int) -> str:
+    u16 = text.encode("utf-16-le")
+    new = u16[:offset * 2] + u16[(offset + length) * 2:]
+    return new.decode("utf-16-le")
+
+
+class Msg:
+    """Построитель сообщений с ручными сущностями (bold / custom_emoji)."""
+
+    def __init__(self):
+        self.text = ""
+        self.entities: List[MessageEntity] = []
+
+    def add_text(self, s: str) -> "Msg":
+        self.text += s
+        return self
+
+    def add_bold(self, s: str) -> "Msg":
+        offset = _utf16_len(self.text)
+        self.text += s
+        length = _utf16_len(s)
+        if length:
+            self.entities.append(MessageEntity(type="bold", offset=offset, length=length))
+        return self
+
+    def add_custom_emoji(self, fallback: Optional[str], custom_emoji_id: Optional[str]) -> "Msg":
+        fallback = fallback or "🏒"
+        offset = _utf16_len(self.text)
+        self.text += fallback
+        length = _utf16_len(fallback)
+        if custom_emoji_id and length:
+            self.entities.append(
+                MessageEntity(
+                    type="custom_emoji",
+                    offset=offset,
+                    length=length,
+                    custom_emoji_id=custom_emoji_id,
+                )
+            )
+        return self
+
+    def build(self):
+        return self.text, (self.entities or None)
+
+
+async def send_msg(target: Message, m: Msg, reply_markup=None) -> None:
+    text, entities = m.build()
+    kwargs = {"reply_markup": reply_markup} if reply_markup is not None else {}
+    if entities:
+        await target.answer(text, entities=entities, parse_mode=None, **kwargs)
+    else:
+        await target.answer(text, **kwargs)
+
+
+def parse_team_name_message(message: Message):
+    text = message.text or message.caption or ""
+    entities = message.entities or message.caption_entities or []
+    for e in entities:
+        if e.type == "custom_emoji":
+            fallback = extract_utf16_substring(text, e.offset, e.length)
+            clean = _strip_utf16_range(text, e.offset, e.length).strip()
+            return clean, fallback, e.custom_emoji_id
+    return text.strip(), None, None
+
+
+def _team_label(row) -> str:
+    return row["team_name"] if row["team_name"] else NO_TEAM_LABEL
+
+
+def format_top_list(stat_key: str, players) -> str:
+    title = STAT_TITLES[stat_key]
+    label = STAT_LABELS[stat_key]
+    if not players:
+        return f"<b>{title}</b>\n\nПока нет данных для отображения."
+
+    lines = [f"<b>{title}</b>\n"]
+    for idx, p in enumerate(players, start=1):
+        marker = MEDALS.get(idx, f"{idx}.")
+        team = _team_label(p)
+        value = p[stat_key]
+        lines.append(
+            f"{marker} <b>{p['nickname']} #{p['number']}</b> — {team}\n"
+            f"     ▸ {value} {label} (М: {p['matches_played']})"
+        )
+    return "\n".join(lines)
+
+
+# ---------- Клавиатуры ----------
+BTN_TOP_SCORERS = "🏆 Топ-10 бомбардиров"
+BTN_TOP_SNIPERS = "🎯 Топ-10 снайперов"
+BTN_TOP_ASSISTS = "🅰️ Топ-10 Ассистентов"
+BTN_TEAM_ROSTER = "👥 Состав команды"
+BTN_FIND_PLAYER = "🔍 Найти игрока"
+
+
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton(text=BTN_TOP_SCORERS)],
+        [KeyboardButton(text=BTN_TOP_SNIPERS), KeyboardButton(text=BTN_TOP_ASSISTS)],
+        [KeyboardButton(text=BTN_TEAM_ROSTER)],
+        [KeyboardButton(text=BTN_FIND_PLAYER)],
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+
+def teams_inline_kb(teams) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=t["name"], callback_data=f"team:{t['id']}")] for t in teams]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def players_choice_kb(players) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"{p['nickname']} #{p['number']}", callback_data=f"player:{p['id']}")]
+        for p in players
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_main_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="🏒 Команды", callback_data="adm:teams")],
+        [InlineKeyboardButton(text="📋 Обновить состав", callback_data="adm:roster")],
+        [InlineKeyboardButton(text="➕ Добавить очки", callback_data="adm:points")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_teams_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="➕ Создать команду", callback_data="adm:team:create")],
+        [InlineKeyboardButton(text="🗑 Удалить команду", callback_data="adm:team:delete")],
+        [InlineKeyboardButton(text="📃 Список команд", callback_data="adm:team:list")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:back")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def teams_list_kb(teams, callback_prefix: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=t["name"], callback_data=f"{callback_prefix}:{t['id']}")]
+        for t in teams
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------- Пользовательские хендлеры ----------
+user_router = Router()
+
+
+@user_router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    text = (
+        "🏒 <b>Добро пожаловать в бота Innovative Hockey League!</b>\n\n"
+        "Выберите, что хотите посмотреть 👇"
+    )
+    await message.answer(text, reply_markup=main_menu_kb())
+
+
+@user_router.message(F.text == BTN_TOP_SCORERS)
+async def show_top_scorers(message: Message):
+    players = await top_scorers(10)
+    await message.answer(format_top_list("points", players))
+
+
+@user_router.message(F.text == BTN_TOP_SNIPERS)
+async def show_top_snipers(message: Message):
+    players = await top_snipers(10)
+    await message.answer(format_top_list("goals", players))
+
+
+@user_router.message(F.text == BTN_TOP_ASSISTS)
+async def show_top_assistants(message: Message):
+    players = await top_assistants(10)
+    await message.answer(format_top_list("assists", players))
+
+
+@user_router.message(F.text == BTN_TEAM_ROSTER)
+async def show_team_roster_menu(message: Message):
+    teams = await get_teams()
+    if not teams:
+        await message.answer("Команды пока не добавлены. Загляните позже 🙂")
+        return
+    await message.answer("Выберите команду:", reply_markup=teams_inline_kb(teams))
+
+
+@user_router.callback_query(F.data.startswith("team:"))
+async def show_team_roster(callback: CallbackQuery):
+    team_id = int(callback.data.split(":")[1])
+    team = await get_team(team_id)
+    if team is None:
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+    roster = await get_team_roster(team_id)
+
+    m = Msg()
+    m.add_custom_emoji(team["emoji_char"], team["custom_emoji_id"])
+    m.add_bold(f" {team['name']}\n")
+    m.add_text(f"Игроков в составе: {len(roster)}\n\n")
+
+    if not roster:
+        m.add_text("Состав пока пуст.")
+    else:
+        for p in roster:
+            if p["is_goalkeeper"]:
+                pct = round(p["saves"] / p["shots_against"] * 100, 1) if p["shots_against"] else 0.0
+                m.add_bold(f"🥅 {p['nickname']} #{p['number']}\n")
+                m.add_text(
+                    f"    Матчей: {p['matches_played']} · Отражено: {p['saves']}/{p['shots_against']} ({pct}%)\n\n"
+                )
+            else:
+                m.add_bold(f"⛸ {p['nickname']} #{p['number']}\n")
+                m.add_text(
+                    f"    Матчей: {p['matches_played']} · Г: {p['goals']} · П: {p['assists']} · О: {p['points']}\n\n"
+                )
+
+    await send_msg(callback.message, m)
+    await callback.answer()
+
+
+@user_router.message(F.text == BTN_FIND_PLAYER)
+async def find_player_prompt(message: Message, state: FSMContext):
+    await state.set_state(UserSearchStates.waiting_nickname)
+    await message.answer("Введите ник игрока (без номера):")
+
+
+async def _send_player_card(target: Message, p) -> None:
+    m = Msg()
+    icon = "🥅" if p["is_goalkeeper"] else "⛸"
+    m.add_text(f"{icon} ")
+    m.add_bold(f"{p['nickname']} #{p['number']}\n")
+
+    if p["team_name"]:
+        m.add_custom_emoji(p["emoji_char"], p["custom_emoji_id"])
+        m.add_text(f" {p['team_name']}\n\n")
+    else:
+        m.add_text(f"{NO_TEAM_LABEL}\n\n")
+
+    m.add_text(f"Матчей сыграно: {p['matches_played']}\n")
+    if p["is_goalkeeper"]:
+        pct = round(p["saves"] / p["shots_against"] * 100, 1) if p["shots_against"] else 0.0
+        m.add_text(f"Отражено бросков: {p['saves']}/{p['shots_against']} ({pct}%)\n")
+    else:
+        m.add_text(f"Голы: {p['goals']}\nПередачи: {p['assists']}\nОчки: {p['points']}\n")
+
+    await send_msg(target, m)
+
+
+@user_router.message(UserSearchStates.waiting_nickname)
+async def find_player_process(message: Message, state: FSMContext):
+    await state.clear()
+    query = (message.text or "").strip()
+    if not query:
+        await message.answer("Пустой запрос. Попробуйте ещё раз через кнопку «🔍 Найти игрока».")
+        return
+
+    players = await search_players(query)
+    if not players:
+        await message.answer("😕 Игрок не найден. Проверьте ник и попробуйте снова.")
+        return
+    if len(players) == 1:
+        await _send_player_card(message, players[0])
+        return
+
+    await message.answer(
+        f"Найдено несколько игроков ({len(players)}). Выберите нужного:",
+        reply_markup=players_choice_kb(players),
+    )
+
+
+@user_router.callback_query(F.data.startswith("player:"))
+async def show_player_by_callback(callback: CallbackQuery):
+    player_id = int(callback.data.split(":")[1])
+    player = await get_player_full(player_id)
+    if player is None:
+        await callback.answer("Игрок не найден", show_alert=True)
+        return
+    await _send_player_card(callback.message, player)
+    await callback.answer()
+
+
+# ---------- Админские хендлеры ----------
+admin_router = Router()
+ADMIN_TITLE = "🛠 <b>Админ-панель Innovative Hockey League</b>\n\nВыберите раздел:"
+
+
+@admin_router.message(Command("adminka"))
+async def cmd_adminka(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа к админ-панели.")
+        return
+    await state.clear()
+    await message.answer(ADMIN_TITLE, reply_markup=admin_main_kb())
+
+
+@admin_router.callback_query(F.data == "adm:back")
+async def adm_back(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(ADMIN_TITLE, reply_markup=admin_main_kb())
+    await callback.answer()
+
+
+# --- Команды ---
+@admin_router.callback_query(F.data == "adm:teams")
+async def adm_teams_menu(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    await callback.message.edit_text("🏒 Управление командами:", reply_markup=admin_teams_kb())
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "adm:team:create")
+async def adm_team_create_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminTeamStates.creating_name)
+    await callback.message.edit_text(
+        "Отправьте название команды.\n\n"
+        "💎 Если хотите прикрепить премиум-эмодзи как логотип — вставьте его прямо в текст "
+        "названия (в любом месте), бот сам его распознает и сохранит.\n\n"
+        "Например: <эмодзи> ФК Атлант"
+    )
+    await callback.answer()
+
+
+@admin_router.message(AdminTeamStates.creating_name)
+async def adm_team_create_finish(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    name, fallback, custom_emoji_id = parse_team_name_message(message)
+    if not name:
+        await message.answer(
+            "Название не может быть пустым. Попробуйте снова: откройте /adminka → Команды → "
+            "Создать команду."
+        )
+        return
+    team = await create_team(name, fallback, custom_emoji_id)
+    logo_note = " (с логотипом)" if custom_emoji_id else ""
+    await message.answer(
+        f"✅ Команда «{team['name']}»{logo_note} создана.", reply_markup=admin_teams_kb()
+    )
+
+
+@admin_router.callback_query(F.data == "adm:team:delete")
+async def adm_team_delete_menu(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    teams = await get_teams()
+    if not teams:
+        await callback.answer("Нет команд для удаления", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "Выберите команду для удаления:", reply_markup=teams_list_kb(teams, "adm:team:del")
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data.startswith("adm:team:del:"))
+async def adm_team_delete_confirm(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    team_id = int(callback.data.split(":")[-1])
+    team = await get_team(team_id)
+    if team is None:
+        await callback.answer("Команда уже удалена", show_alert=True)
+        return
+    await delete_team(team_id)
+    await callback.message.edit_text(
+        f"🗑 Команда «{team['name']}» удалена. Её игроки остались в базе, но без привязки к команде.",
+        reply_markup=admin_teams_kb(),
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "adm:team:list")
+async def adm_team_list(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    teams = await get_teams()
+    if not teams:
+        text = "Команд пока нет."
+    else:
+        text = "📃 <b>Список команд:</b>\n\n" + "\n".join(f"• {t['name']}" for t in teams)
+    await callback.message.edit_text(text, reply_markup=admin_teams_kb())
+    await callback.answer()
+
+
+# --- Обновление состава ---
+@admin_router.callback_query(F.data == "adm:roster")
+async def adm_roster_menu(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    teams = await get_teams()
+    if not teams:
+        await callback.answer("Сначала создайте хотя бы одну команду", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "Выберите команду, состав которой нужно обновить:",
+        reply_markup=teams_list_kb(teams, "adm:roster:team"),
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data.startswith("adm:roster:team:"))
+async def adm_roster_team_selected(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    team_id = int(callback.data.split(":")[-1])
+    team = await get_team(team_id)
+    if team is None:
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+    await state.set_state(AdminRosterStates.waiting_list)
+    await state.update_data(team_id=team_id)
+    example = "miulio #9\nfrong #21\npetrov #64"
+    await callback.message.edit_text(
+        f"Команда: <b>{team['name']}</b>\n\n"
+        f"Отправьте список игроков, каждый на новой строке, в формате:\n<code>{example}</code>\n\n"
+        "⚠️ Этот список <b>полностью заменит</b> текущий состав команды."
+    )
+    await callback.answer()
+
+
+@admin_router.message(AdminRosterStates.waiting_list)
+async def adm_roster_list_process(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    team_id = data.get("team_id")
+    await state.clear()
+
+    if team_id is None:
+        await message.answer("Что-то пошло не так, начните заново через /adminka.")
+        return
+
+    entries, errors = parse_roster_lines(message.text or "")
+    if not entries:
+        await message.answer(
+            "Не удалось разобрать ни одной строки. Проверьте формат "
+            "(ник #номер, каждый игрок на новой строке) и попробуйте снова через /adminka."
+        )
+        return
+
+    keep_ids: List[int] = []
+    created, updated = 0, 0
+    for nickname, number in entries:
+        player_id, was_created = await upsert_roster_player(nickname, number, team_id)
+        keep_ids.append(player_id)
+        if was_created:
+            created += 1
+        else:
+            updated += 1
+
+    await clear_team_roster_except(team_id, keep_ids)
+    team = await get_team(team_id)
+
+    summary = (
+        f"✅ Состав команды «{team['name']}» обновлён.\n"
+        f"Новых игроков: {created}\nПривязано существующих: {updated}"
+    )
+    if errors:
+        bad = "\n".join(f"• строка {i}: {line}" for i, line in errors)
+        summary += f"\n\n⚠️ Не распознаны строки:\n{bad}"
+    await message.answer(summary)
+
+
+# --- Добавление очков ---
+@admin_router.callback_query(F.data == "adm:points")
+async def adm_points_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminPointsStates.waiting_list)
+    example = "miulio #9 2 8 +\ndube #42 15/18 + gk\nsigma #1 4 5 +"
+    await callback.message.edit_text(
+        "Отправьте статистику матча — каждая строка отдельным игроком.\n\n"
+        "<b>Полевые игроки:</b>\n<code>ник #номер голы передачи +/-</code>\n\n"
+        "<b>Вратари:</b>\n<code>ник #номер отражено/всего +/- gk</code>\n\n"
+        f"Пример:\n<code>{example}</code>\n\n"
+        "«+» — добавить статистику и засчитать матч, «−» — вычесть "
+        "(отменить ошибочно внесённую запись). Очки (Г+П) бот считает сам.\n"
+        "Если игрока нет в базе — он будет создан автоматически (без привязки к команде)."
+    )
+    await callback.answer()
+
+
+@admin_router.message(AdminPointsStates.waiting_list)
+async def adm_points_process(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+
+    results, errors = parse_points_lines(message.text or "")
+    if not results:
+        await message.answer(
+            "Не удалось разобрать ни одной строки. Проверьте формат и попробуйте снова через /adminka."
+        )
+        return
+
+    report_lines = []
+    for r in results:
+        if r["type"] == "gk":
+            _, created = await apply_goalkeeper_stats(
+                r["nickname"], r["number"], r["saves"], r["shots"], r["sign"]
+            )
+            tag = "🆕" if created else "✏️"
+            report_lines.append(
+                f"{tag} 🥅 {r['nickname']} #{r['number']}: {r['sign']} {r['saves']}/{r['shots']}"
+            )
+        else:
+            _, created = await apply_skater_stats(
+                r["nickname"], r["number"], r["goals"], r["assists"], r["sign"]
+            )
+            tag = "🆕" if created else "✏️"
+            report_lines.append(
+                f"{tag} ⛸ {r['nickname']} #{r['number']}: {r['sign']} Г{r['goals']} П{r['assists']}"
+            )
+
+    summary = "✅ <b>Статистика обновлена:</b>\n\n" + "\n".join(report_lines)
+    if errors:
+        bad = "\n".join(f"• строка {i}: {line}" for i, line in errors)
+        summary += f"\n\n⚠️ Не распознаны строки:\n{bad}"
+    await message.answer(summary)
+
+
+# ---------- Точка входа ----------
+async def main() -> None:
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+
+    # Регистрируем роутеры (админский – первым)
+    dp.include_router(admin_router)
+    dp.include_router(user_router)
+
+    # Инициализируем БД
+    await init_pool()
+
+    try:
+        await bot.set_my_commands([BotCommand(command="start", description="Главное меню")])
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Бот запущен, начинаю polling...")
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.critical("Критическая ошибка во время работы: %s", e)
+        raise
+    finally:
+        await close_pool()
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
