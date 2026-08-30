@@ -385,6 +385,24 @@ async def top_assistants(limit: int = 10):
         )
 
 
+async def top_goalkeepers(limit: int = 10):
+    if pool is None:
+        raise RuntimeError("Пул не инициализирован")
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT p.*, t.name AS team_name, t.emoji_char, t.custom_emoji_id,
+                   CASE WHEN p.shots_against > 0 THEN ROUND((p.saves::numeric / p.shots_against::numeric) * 100, 1) ELSE 0 END AS save_pct
+            FROM players p
+            LEFT JOIN teams t ON p.team_id = t.id
+            WHERE p.is_goalkeeper = TRUE AND p.matches_played > 0
+            ORDER BY save_pct DESC, p.saves DESC, p.matches_played DESC, p.nickname ASC
+            LIMIT $1;
+            """,
+            limit,
+        )
+
+
 # ---------- FSM состояния ----------
 class AdminTeamStates(StatesGroup):
     creating_name = State()
@@ -592,22 +610,92 @@ def format_top_list(stat_key: str, players) -> str:
     return "\n".join(lines)
 
 
+def format_top_goalkeepers(players) -> str:
+    title = "🥅 Топ-10 вратарей (% отраженных бросков)"
+    if not players:
+        return f"<b>{title}</b>\n\n📊 Пока нет данных для отображения."
+
+    lines = [f"<b>{title}</b>\n"]
+    for idx, p in enumerate(players, start=1):
+        marker = MEDALS.get(idx, f"<b>{idx}.</b>")
+        team_str = _team_label_html(p)
+        save_pct = p["save_pct"]
+        nick = html.escape(p['nickname'])
+        lines.append(
+            f"{marker} <b>{nick} #{p['number']}</b> — {team_str}\n"
+            f"     ▸ <b>{save_pct}% ОБ</b> ({p['saves']}/{p['shots_against']} бросков, 👕 Матчей: {p['matches_played']})"
+        )
+    return "\n".join(lines)
+
+
+async def get_main_menu_text() -> str:
+    """Формирует текст главного меню с лидерами лиги."""
+    best_gk = await top_goalkeepers(1)
+    best_sn = await top_snipers(1)
+    best_sc = await top_scorers(1)
+    best_as = await top_assistants(1)
+
+    def _format_leader(lst, val_key=None, suffix=""):
+        if not lst:
+            return "Пока нет данных"
+        p = lst[0]
+        nick = html.escape(p['nickname'])
+        team_str = _team_label_html(p)
+        if val_key:
+            val = p[val_key]
+            return f"<b>{nick} #{p['number']}</b> — {team_str} (<b>{val}{suffix}</b>)"
+        return f"<b>{nick} #{p['number']}</b> — {team_str}"
+
+    gk_str = _format_leader(best_gk, "save_pct", "% ОБ")
+    sn_str = _format_leader(best_sn, "goals", " гол.")
+    sc_str = _format_leader(best_sc, "points", " очк.")
+    as_str = _format_leader(best_as, "assists", " пас.")
+
+    return (
+        "🏒 <b>Добро пожаловать в бота Innovative Hockey League!</b>\n\n"
+        f"🥅 <b>Самый Лучший Вратарь Лиги:</b> {gk_str}\n"
+        f"🎯 <b>Самый Лучший Снайпер Лиги:</b> {sn_str}\n"
+        f"🏆 <b>Самый Лучший Бомбардир Лиги:</b> {sc_str}\n"
+        f"🅰️ <b>Самый Лучший Ассистент Лиги:</b> {as_str}\n\n"
+        "Выберите интересующий раздел из меню ниже 👇"
+    )
+
+
 # ---------- Клавиатуры ----------
-BTN_TOP_SCORERS = "🏆 Топ-10 бомбардиров"
-BTN_TOP_SNIPERS = "🎯 Топ-10 снайперов"
-BTN_TOP_ASSISTS = "🅰️ Топ-10 ассистентов"
-BTN_TEAM_ROSTER = "👥 Состав команды"
-BTN_FIND_PLAYER = "🔍 Найти игрока"
+BTN_MAIN_MENU = "🏠 Главное меню"
 
 
-def main_menu_kb() -> ReplyKeyboardMarkup:
+def persistent_reply_kb() -> ReplyKeyboardMarkup:
+    """Нижняя постоянная клавиатура."""
     keyboard = [
-        [KeyboardButton(text=BTN_TOP_SCORERS)],
-        [KeyboardButton(text=BTN_TOP_SNIPERS), KeyboardButton(text=BTN_TOP_ASSISTS)],
-        [KeyboardButton(text=BTN_TEAM_ROSTER)],
-        [KeyboardButton(text=BTN_FIND_PLAYER)],
+        [KeyboardButton(text=BTN_MAIN_MENU)]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+
+def main_menu_inline_kb() -> InlineKeyboardMarkup:
+    """Встроенные кнопки главного меню под сообщением."""
+    rows = [
+        [InlineKeyboardButton(text="🏆 Топ-10 бомбардиров", callback_data="user:top:scorers")],
+        [
+            InlineKeyboardButton(text="🎯 Топ-10 снайперов", callback_data="user:top:snipers"),
+            InlineKeyboardButton(text="🅰️ Топ-10 ассистентов", callback_data="user:top:assists")
+        ],
+        [InlineKeyboardButton(text="🥅 Топ-10 вратарей", callback_data="user:top:goalkeepers")],
+        [
+            InlineKeyboardButton(text="👥 Состав команды", callback_data="user:teams"),
+            InlineKeyboardButton(text="🔍 Найти игрока", callback_data="user:search")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def back_to_main_kb() -> InlineKeyboardMarkup:
+    """Кнопка возврата в главное меню."""
+    rows = [
+        [InlineKeyboardButton(text="⬅️ Вернуться в главное меню", callback_data="user:main_menu")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def teams_inline_kb(teams) -> InlineKeyboardMarkup:
@@ -618,6 +706,15 @@ def teams_inline_kb(teams) -> InlineKeyboardMarkup:
         )]
         for t in teams
     ]
+    rows.append([InlineKeyboardButton(text="⬅️ Вернуться в главное меню", callback_data="user:main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def team_roster_back_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="⬅️ Назад к выбору команд", callback_data="user:teams")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="user:main_menu")]
+    ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -626,6 +723,7 @@ def players_choice_kb(players) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"👤 {p['nickname']} #{p['number']}", callback_data=f"player:{p['id']}")]
         for p in players
     ]
+    rows.append([InlineKeyboardButton(text="⬅️ Вернуться в главное меню", callback_data="user:main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -670,40 +768,75 @@ user_router = Router()
 
 
 @user_router.message(CommandStart())
+@user_router.message(F.text == BTN_MAIN_MENU)
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    text = (
-        "🏒 <b>Добро пожаловать в бота Innovative Hockey League!</b>\n\n"
-        "Выберите раздел из меню ниже 👇"
+    text = await get_main_menu_text()
+    await message.answer(
+        text,
+        reply_markup=persistent_reply_kb()
     )
-    await message.answer(text, reply_markup=main_menu_kb())
+    # Сообщение с кнопками под ним
+    await message.answer(
+        "📍 <b>Главное меню:</b>",
+        reply_markup=main_menu_inline_kb()
+    )
 
 
-@user_router.message(F.text == BTN_TOP_SCORERS)
-async def show_top_scorers(message: Message):
+@user_router.callback_query(F.data == "user:main_menu")
+async def callback_main_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer()
+    text = await get_main_menu_text()
+    await callback.message.edit_text(
+        text,
+        reply_markup=main_menu_inline_kb()
+    )
+
+
+@user_router.callback_query(F.data == "user:top:scorers")
+async def show_top_scorers(callback: CallbackQuery):
+    await callback.answer()
     players = await top_scorers(10)
-    await message.answer(format_top_list("points", players))
+    text = format_top_list("points", players)
+    await callback.message.edit_text(text, reply_markup=back_to_main_kb())
 
 
-@user_router.message(F.text == BTN_TOP_SNIPERS)
-async def show_top_snipers(message: Message):
+@user_router.callback_query(F.data == "user:top:snipers")
+async def show_top_snipers(callback: CallbackQuery):
+    await callback.answer()
     players = await top_snipers(10)
-    await message.answer(format_top_list("goals", players))
+    text = format_top_list("goals", players)
+    await callback.message.edit_text(text, reply_markup=back_to_main_kb())
 
 
-@user_router.message(F.text == BTN_TOP_ASSISTS)
-async def show_top_assistants(message: Message):
+@user_router.callback_query(F.data == "user:top:assists")
+async def show_top_assistants(callback: CallbackQuery):
+    await callback.answer()
     players = await top_assistants(10)
-    await message.answer(format_top_list("assists", players))
+    text = format_top_list("assists", players)
+    await callback.message.edit_text(text, reply_markup=back_to_main_kb())
 
 
-@user_router.message(F.text == BTN_TEAM_ROSTER)
-async def show_team_roster_menu(message: Message):
+@user_router.callback_query(F.data == "user:top:goalkeepers")
+async def show_top_goalkeepers(callback: CallbackQuery):
+    await callback.answer()
+    players = await top_goalkeepers(10)
+    text = format_top_goalkeepers(players)
+    await callback.message.edit_text(text, reply_markup=back_to_main_kb())
+
+
+@user_router.callback_query(F.data == "user:teams")
+async def show_team_roster_menu(callback: CallbackQuery):
+    await callback.answer()
     teams = await get_teams()
     if not teams:
-        await message.answer("📊 Команды пока не добавлены. Загляните позже 🙂")
+        await callback.message.edit_text(
+            "📊 <b>Команды пока не добавлены.</b> Загляните позже 🙂",
+            reply_markup=back_to_main_kb()
+        )
         return
-    await message.answer("👥 <b>Выберите команду:</b>", reply_markup=teams_inline_kb(teams))
+    await callback.message.edit_text("👥 <b>Выберите команду:</b>", reply_markup=teams_inline_kb(teams))
 
 
 @user_router.callback_query(F.data.startswith("team:"))
@@ -737,13 +870,17 @@ async def show_team_roster(callback: CallbackQuery):
                     f"    👕 Матчей: {p['matches_played']} · 🎯 Г: {p['goals']} · 🅰️ П: {p['assists']} · 🏆 О: {p['points']}\n\n"
                 )
 
-    await send_msg(callback.message, m)
+    await send_msg(callback.message, m, reply_markup=team_roster_back_kb())
 
 
-@user_router.message(F.text == BTN_FIND_PLAYER)
-async def find_player_prompt(message: Message, state: FSMContext):
+@user_router.callback_query(F.data == "user:search")
+async def find_player_prompt(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     await state.set_state(UserSearchStates.waiting_nickname)
-    await message.answer("🔍 <b>Введите ник игрока (без номера):</b>")
+    await callback.message.edit_text(
+        "🔍 <b>Введите ник игрока (без номера):</b>",
+        reply_markup=back_to_main_kb()
+    )
 
 
 async def _send_player_card(target: Message, p) -> None:
@@ -765,7 +902,7 @@ async def _send_player_card(target: Message, p) -> None:
     else:
         m.add_text(f"🎯 Голы: {p['goals']}\n🅰️ Передачи: {p['assists']}\n🏆 Очки: {p['points']}\n")
 
-    await send_msg(target, m)
+    await send_msg(target, m, reply_markup=back_to_main_kb())
 
 
 @user_router.message(UserSearchStates.waiting_nickname)
@@ -773,12 +910,18 @@ async def find_player_process(message: Message, state: FSMContext):
     await state.clear()
     query = (message.text or "").strip()
     if not query:
-        await message.answer("⚠️ Пустой запрос. Попробуйте ещё раз через кнопку «🔍 Найти игрока».")
+        await message.answer(
+            "⚠️ Пустой запрос. Попробуйте ещё раз через главное меню.",
+            reply_markup=back_to_main_kb()
+        )
         return
 
     players = await search_players(query)
     if not players:
-        await message.answer("😕 Игрок не найден. Проверьте ник и попробуйте снова.")
+        await message.answer(
+            "😕 Игрок не найден. Проверьте ник и попробуйте снова.",
+            reply_markup=back_to_main_kb()
+        )
         return
     if len(players) == 1:
         await _send_player_card(message, players[0])
@@ -822,11 +965,8 @@ async def adm_exit(callback: CallbackQuery, state: FSMContext):
         return
     await callback.answer("🚪 Вы вышли из админки")
     await state.clear()
-    await callback.message.edit_text(
-        "🚪 <b>Вы успешно вышли из админ-панели.</b>\n\nИспользуйте меню ниже для навигации:",
-        reply_markup=None
-    )
-    await callback.message.answer("📍 <b>Главное меню:</b>", reply_markup=main_menu_kb())
+    text = await get_main_menu_text()
+    await callback.message.edit_text(text, reply_markup=main_menu_inline_kb())
 
 
 @admin_router.callback_query(F.data == "adm:back")
