@@ -1,5 +1,6 @@
 import asyncio
 import html
+import io  # ДОБАВЛЕНО ДЛЯ КАРТИНОК
 import logging
 import os
 import re
@@ -7,6 +8,7 @@ from typing import List, Tuple, Optional, Dict, Any
 
 import asyncpg
 from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont  # ДОБАВЛЕНО
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
@@ -24,6 +26,7 @@ from aiogram.types import (
     Message,
     MessageEntity,
     ReplyKeyboardMarkup,
+    BufferedInputFile,  # ДОБАВЛЕНО ДЛЯ ОТПРАВКИ ФОТО
 )
 
 # ---------- Настройка логирования ----------
@@ -61,10 +64,66 @@ if not ADMIN_IDS:
         "Переменная ADMIN_IDS пуста — команда /adminka недоступна никому."
     )
 
+# ---------- НАСТРОЙКИ ДЛЯ ГЕНЕРАЦИИ КАРТИНОК ----------
+# Пути к вашим шаблонам (лежат в папке с ботом)
+TOP_IMAGES = {
+    "points": "top_scorers.png",        # Бомбардиры
+    "goals": "top_snipers.png",         # Снайперы
+    "assists": "top_assistants.png",    # Ассистенты
+    "goalkeepers": "top_goalkeepers.png", # Вратари
+}
+# Путь к шрифту с кириллицей
+FONT_PATH = "DejaVuSans-Bold.ttf" 
+# Координаты (X, Y) центров 10 строк. ОБЯЗАТЕЛЬНО ЗАМЕРЬТЕ В ФОТОШОПЕ!
+ROW_COORDS = [
+    (540, 200), (540, 280), (540, 360), (540, 440), (540, 520),
+    (540, 600), (540, 680), (540, 760), (540, 840), (540, 920)
+]
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+# ---------- Функция создания картинки ----------
+def create_top_image(stat_key: str, players: list) -> io.BytesIO:
+    image_path = TOP_IMAGES.get(stat_key, TOP_IMAGES["goals"])
+    img = Image.open(image_path).convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    try:
+        font = ImageFont.truetype(FONT_PATH, 36)
+    except IOError:
+        logger.warning(f"Шрифт {FONT_PATH} не найден, используется стандартный!")
+        font = ImageFont.load_default()
+
+    for idx, player in enumerate(players[:10]):
+        if idx >= len(ROW_COORDS): break
+
+        x, y = ROW_COORDS[idx]
+        
+        medal = ["🥇", "🥈", "🥉"][idx] if idx < 3 else f"{idx+1}."
+        
+        # Форматируем название команды (она уже приходит в SQL запросе как team_name)
+        team_name = player["team_name"] if player["team_name"] else "Без команды"
+        
+        # Формируем текст в зависимости от типа статистики
+        if stat_key == "goalkeepers":
+            # Ник Номер | Команда | %ОБ | a/b
+            save_pct = player["save_pct"]
+            saves = player["saves"]
+            shots = player["shots_against"]
+            text = f"{medal} {player['nickname']} #{player['number']} | {team_name} | {save_pct}% ОБ | {saves}/{shots}"
+        else:
+            # Ник Номер | Команда | Количество данных
+            value = player[stat_key]
+            text = f"{medal} {player['nickname']} #{player['number']} | {team_name} | {value}"
+
+        # anchor="mm" центрирует текст строго по координатам (x, y)
+        draw.text((x, y), text, font=font, fill="#1a4e5a", anchor="mm")
+
+    img_bytes = io.BytesIO()
+    img.save(img_bytes, format='PNG')
+    img_bytes.seek(0)
+    return img_bytes
 
 # ---------- База данных ----------
 pool: Optional[asyncpg.Pool] = None
@@ -794,36 +853,76 @@ async def callback_main_menu(callback: CallbackQuery, state: FSMContext):
     )
 
 
+# --- ОБНОВЛЕННЫЕ ОБРАБОТЧИКИ ТОПОВ (ОТПРАВКА ФОТО) ---
+
 @user_router.callback_query(F.data == "user:top:scorers")
 async def show_top_scorers(callback: CallbackQuery):
     await callback.answer()
     players = await top_scorers(10)
-    text = format_top_list("points", players)
-    await callback.message.edit_text(text, reply_markup=back_to_main_kb())
+    if not players:
+        await callback.message.edit_text("📊 Пока нет данных.", reply_markup=back_to_main_kb())
+        return
+    
+    # Генерируем картинку
+    img_buffer = create_top_image("points", players)
+    
+    # Отправляем фото
+    await callback.message.answer_photo(
+        photo=BufferedInputFile(img_buffer.getvalue(), filename="top_scorers.png"),
+        caption=format_top_list("points", players),
+        reply_markup=back_to_main_kb()
+    )
 
 
 @user_router.callback_query(F.data == "user:top:snipers")
 async def show_top_snipers(callback: CallbackQuery):
     await callback.answer()
     players = await top_snipers(10)
-    text = format_top_list("goals", players)
-    await callback.message.edit_text(text, reply_markup=back_to_main_kb())
+    if not players:
+        await callback.message.edit_text("📊 Пока нет данных.", reply_markup=back_to_main_kb())
+        return
+
+    img_buffer = create_top_image("goals", players)
+
+    await callback.message.answer_photo(
+        photo=BufferedInputFile(img_buffer.getvalue(), filename="top_snipers.png"),
+        caption=format_top_list("goals", players),
+        reply_markup=back_to_main_kb()
+    )
 
 
 @user_router.callback_query(F.data == "user:top:assists")
 async def show_top_assistants(callback: CallbackQuery):
     await callback.answer()
     players = await top_assistants(10)
-    text = format_top_list("assists", players)
-    await callback.message.edit_text(text, reply_markup=back_to_main_kb())
+    if not players:
+        await callback.message.edit_text("📊 Пока нет данных.", reply_markup=back_to_main_kb())
+        return
+
+    img_buffer = create_top_image("assists", players)
+
+    await callback.message.answer_photo(
+        photo=BufferedInputFile(img_buffer.getvalue(), filename="top_assistants.png"),
+        caption=format_top_list("assists", players),
+        reply_markup=back_to_main_kb()
+    )
 
 
 @user_router.callback_query(F.data == "user:top:goalkeepers")
 async def show_top_goalkeepers(callback: CallbackQuery):
     await callback.answer()
     players = await top_goalkeepers(10)
-    text = format_top_goalkeepers(players)
-    await callback.message.edit_text(text, reply_markup=back_to_main_kb())
+    if not players:
+        await callback.message.edit_text("📊 Пока нет данных.", reply_markup=back_to_main_kb())
+        return
+
+    img_buffer = create_top_image("goalkeepers", players)
+
+    await callback.message.answer_photo(
+        photo=BufferedInputFile(img_buffer.getvalue(), filename="top_goalkeepers.png"),
+        caption=format_top_goalkeepers(players),
+        reply_markup=back_to_main_kb()
+    )
 
 
 @user_router.callback_query(F.data == "user:teams")
