@@ -91,7 +91,7 @@ def create_top_image(stat_key: str, players: list) -> io.BytesIO:
 
     try:
         # ИЗМЕНИТЕ РАЗМЕР ШРИФТА (число 36) НА НУЖНЫЙ, ЕСЛИ ТЕКСТ ВЫЛАЗИТ ЗА РАМКИ
-        font = ImageFont.truetype(FONT_PATH, 26)
+        font = ImageFont.truetype(FONT_PATH, 19)
     except IOError:
         logger.warning(f"Шрифт {FONT_PATH} не найден, используется стандартный!")
         font = ImageFont.load_default()
